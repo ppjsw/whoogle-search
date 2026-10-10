@@ -186,6 +186,59 @@ class HttpxClient:
             raise last_exc
         raise httpx.HTTPError('Unknown HTTP error')
 
+    def post(self,
+             url: str,
+             headers: Optional[Dict[str, str]] = None,
+             cookies: Optional[Dict[str, str]] = None,
+             data: Optional[Dict[str, Any]] = None,
+             retries: int = 2,
+             backoff_seconds: float = 0.5) -> httpx.Response:
+        """Send a POST request.
+
+        Mirrors :meth:`get` (retry + client-recreation on dead connections) but
+        is never cached, since form submissions are not idempotent responses we
+        want to serve from a shared cache.
+        """
+        last_exc: Optional[Exception] = None
+        attempt = 0
+        while attempt <= retries:
+            try:
+                if self._client.is_closed:
+                    self._recreate_client()
+
+                return self._client.post(
+                    url, headers=headers, cookies=cookies, data=data)
+            except Exception as exc:
+                last_exc = exc
+                should_recreate = False
+
+                if isinstance(exc, (httpx.HTTPError, RuntimeError)):
+                    if "client has been closed" in str(exc).lower():
+                        should_recreate = True
+
+                if H2ProtocolError and isinstance(exc, H2ProtocolError):
+                    should_recreate = True
+
+                if "ProtocolError" in str(exc) or "ConnectionState.CLOSED" in str(exc):
+                    should_recreate = True
+
+                if should_recreate:
+                    self._recreate_client()
+                    if attempt < retries:
+                        time.sleep(backoff_seconds * (2 ** attempt))
+                        attempt += 1
+                        continue
+
+                if attempt == retries:
+                    raise
+
+                time.sleep(backoff_seconds * (2 ** attempt))
+                attempt += 1
+
+        if last_exc:
+            raise last_exc
+        raise httpx.HTTPError('Unknown HTTP error')
+
     def _recreate_client(self) -> None:
         """Recreate the HTTP client when it has been closed."""
         try:
