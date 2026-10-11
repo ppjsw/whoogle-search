@@ -1,6 +1,7 @@
 from app.models.config import Config
 from app.utils.misc import read_config_bool
 from app.services.provider import get_http_client
+from app.services.fetch_backend import get_backend
 from app.utils.ua_generator import load_ua_pool, get_random_ua, DEFAULT_FALLBACK_UA
 from defusedxml import ElementTree as ET
 import httpx
@@ -216,11 +217,15 @@ class Request:
     """
 
     def __init__(self, normal_ua, root_path, config: Config, http_client=None):
-        self.search_url = 'https://www.google.com/search?gbv=1&q='
+        # Selectable fetch backend (WHOOGLE_FETCH_BACKEND). Defaults to the
+        # historical Google HTML path, so behaviour is unchanged unless the
+        # env var is set.
+        self.fetch_backend = get_backend()
+        self.search_url = self.fetch_backend.search_url
         # Google Images rejects the lightweight gbv=1 interface. Use the
         # modern udm=2 entrypoint specifically for image searches to avoid the
         # "update your browser" interstitial.
-        self.image_search_url = 'https://www.google.com/search?udm=2&q='
+        self.image_search_url = self.fetch_backend.image_search_url
         # Optionally send heartbeat to Tor to determine availability
         # Only when Tor is enabled in config to avoid unnecessary socket usage
         if config.tor:
@@ -426,10 +431,22 @@ class Request:
             search_base = self.image_search_url
 
         try:
-            response = self.http_client.get(
-                search_base + query,
-                headers=headers,
-                cookies=consent_cookies)
+            if base_url:
+                # Non-search fetches (autocomplete, element/window proxying)
+                # always go straight to the given URL.
+                response = self.http_client.get(
+                    search_base + query,
+                    headers=headers,
+                    cookies=consent_cookies)
+            else:
+                # Search fetches go through the selected backend, which owns
+                # both the request and the normalisation of the response into
+                # the Google-shaped DOM the rest of Whoogle expects.
+                response = self.fetch_backend.fetch(
+                    self.http_client,
+                    search_base + query,
+                    headers=headers,
+                    cookies=consent_cookies)
         except httpx.HTTPError as e:
             raise
 
