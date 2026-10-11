@@ -1,0 +1,8 @@
+# Runtime dependencies for the Whoogle Search MCP server.
+#
+# There are none. whoogle_mcp_server.py imports only the Python 3.8+
+# standard library (json, sys, os, urllib, socket, ipaddress, html.parser).
+# This file exists so the (empty) dependency surface is explicit and so
+# `pip install -r mcp/requirements.txt` is a no-op that succeeds.
+#
+# This intentionally does NOT touch the main application's requirements.txt.
