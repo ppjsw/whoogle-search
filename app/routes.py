@@ -28,6 +28,13 @@ from app.utils.widgets import *
 from app.utils.results import bold_search_terms,\
     add_currency_card, check_currency, get_tabs_content
 from app.utils.search import Search, needs_https, has_captcha
+from app.utils import json_api
+from app.utils.json_api import \
+    success_payload as json_success_payload, \
+    error_payload as json_error_payload, \
+    parse_limit as json_parse_limit, \
+    classify_empty as json_classify_empty, \
+    wants_json as request_wants_json
 from app.utils.session import valid_user_session
 from bs4 import BeautifulSoup as bsoup
 from flask import jsonify, make_response, request, redirect, render_template, \
@@ -296,36 +303,6 @@ def autocomplete():
         g.user_request.autocomplete(q) if (not g.user_config.tor and autocomplete_enabled) else []
     ])
 
-def clean_text_spacing(text: str) -> str:
-    """Clean up text spacing issues from HTML extraction.
-    
-    Args:
-        text: Text extracted from HTML that may have spacing issues
-        
-    Returns:
-        Cleaned text with proper spacing
-    """
-    if not text:
-        return text
-    
-    # Normalize multiple spaces to single space
-    text = re.sub(r'\s+', ' ', text)
-    
-    # Fix domain names: remove space before period followed by domain extension
-    # Examples: "weather .com" -> "weather.com", "example .org" -> "example.org"
-    text = re.sub(r'\s+\.([a-zA-Z]{2,})\b', r'.\1', text)
-    
-    # Fix www/http/https patterns
-    # Examples: "www .example" -> "www.example"
-    text = re.sub(r'\b(www|http|https)\s+\.', r'\1.', text)
-    
-    # Fix spaces before common punctuation
-    text = re.sub(r'\s+([,;:])', r'\1', text)
-    
-    # Strip leading/trailing whitespace
-    return text.strip()
-
-
 @app.route(f'/{Endpoint.search}', methods=['GET', 'POST'])
 @session_required
 @auth_required
@@ -348,6 +325,8 @@ def search():
     if not query:
         return redirect(url_for('.index'))
 
+    wants_json = request_wants_json(request)
+
     # Generate response and number of external elements from the page
     try:
         response = search_util.generate_response()
@@ -360,33 +339,37 @@ def search():
     except CSEException as e:
         localization_lang = g.user_config.get_localization_lang()
         translation = app.config['TRANSLATIONS'][localization_lang]
-        wants_json = (
-            request.args.get('format') == 'json' or
-            'application/json' in request.headers.get('Accept', '') or
-            'application/*+json' in request.headers.get('Accept', '')
-        )
+        error_type = json_api.ERROR_CSE
         error_msg = f"Custom Search API Error: {e.message}"
         if e.is_quota_error:
+            error_type = json_api.ERROR_CSE_QUOTA
             error_msg = ("Google Custom Search API quota exceeded. "
                         "Free tier allows 100 queries/day. "
                         "Wait until midnight PT or disable CSE in settings.")
         if wants_json:
-            return jsonify({
-                'error': True,
-                'error_message': error_msg,
-                'query': urlparse.unquote(query)
-            }), e.code
+            return jsonify(json_error_payload(
+                urlparse.unquote(query), error_type, error_msg)), e.code
         return render_template(
             'error.html',
             error_message=error_msg,
             translation=translation,
             config=g.user_config), e.code
-
-    wants_json = (
-        request.args.get('format') == 'json' or
-        'application/json' in request.headers.get('Accept', '') or
-        'application/*+json' in request.headers.get('Accept', '')
-    )
+    except httpx.TimeoutException as e:
+        # Note: TimeoutException is a subclass of RequestError, so this
+        # handler must stay above the RequestError one.
+        app.logger.error('504 (upstream timeout): %s', e)
+        if wants_json:
+            return jsonify(json_error_payload(
+                urlparse.unquote(query), json_api.ERROR_TIMEOUT,
+                'Upstream search engine timed out.')), 504
+        raise
+    except httpx.RequestError as e:
+        app.logger.error('502 (upstream error): %s', e)
+        if wants_json:
+            return jsonify(json_error_payload(
+                urlparse.unquote(query), json_api.ERROR_UPSTREAM,
+                'Upstream search engine could not be reached.')), 502
+        raise
 
     if search_util.feeling_lucky:
         if wants_json:
@@ -416,11 +399,9 @@ def search():
             return redirect(fallback_engine + query)
         
         if wants_json:
-            return jsonify({
-                'blocked': True,
-                'error_message': translation['ratelimit'],
-                'query': urlparse.unquote(query)
-            }), 503
+            return jsonify(json_error_payload(
+                urlparse.unquote(query), json_api.ERROR_BLOCKED,
+                translation['ratelimit'], blocked=True)), 503
         else:
             return render_template(
                 'error.html',
@@ -473,116 +454,39 @@ def search():
     cleanresponse = str(response).replace("andlt;","&lt;").replace("andgt;","&gt;")
 
     if wants_json:
-        # Build a parsable JSON from the filtered soup
-        json_soup = bsoup(str(response), 'html.parser')
-        results = []
-        seen = set()
-        
-        # Find all result containers (using known result classes)
-        result_divs = json_soup.find_all('div', class_=['ZINbbc', 'ezO2md'])
-        
-        if result_divs:
-            # Process structured Google results with container divs
-            for div in result_divs:
-                # Find the first valid link in this result container
-                link = None
-                for a in div.find_all('a', href=True):
-                    if a['href'].startswith('http'):
-                        link = a
-                        break
-                
-                if not link:
-                    continue
-                    
-                href = link['href']
-                if href in seen:
-                    continue
-                
-                # Get all text from the result container, not just the link
-                text = clean_text_spacing(div.get_text(separator=' ', strip=True))
-                if not text:
-                    continue
-                
-                # Extract title and content separately
-                # Title is typically in an h3 tag, CVA68e span, or the main link text
-                title = ''
-                # First try h3 tag
-                h3_tag = div.find('h3')
-                if h3_tag:
-                    title = clean_text_spacing(h3_tag.get_text(separator=' ', strip=True))
-                else:
-                    # Try CVA68e class (common title class in Google results)
-                    title_span = div.find('span', class_='CVA68e')
-                    if title_span:
-                        title = clean_text_spacing(title_span.get_text(separator=' ', strip=True))
-                    elif link:
-                        # Fallback to link text, but exclude URL breadcrumb
-                        title = clean_text_spacing(link.get_text(separator=' ', strip=True))
-                
-                # Content is the description/snippet text
-                # Look for description/snippet elements
-                content = ''
-                # Common classes for snippets/descriptions in Google results
-                snippet_selectors = [
-                    {'class_': 'VwiC3b'},   # Standard snippet
-                    {'class_': 'FrIlee'},   # Alternative snippet class (common in current Google)
-                    {'class_': 's'},        # Another snippet class
-                    {'class_': 'st'},       # Legacy snippet class
-                ]
-                
-                for selector in snippet_selectors:
-                    snippet_elem = div.find('span', selector) or div.find('div', selector)
-                    if snippet_elem:
-                        # Get text but exclude any nested links (like "Related searches")
-                        content = clean_text_spacing(snippet_elem.get_text(separator=' ', strip=True))
-                        # Only use if it's substantial content (not just the URL breadcrumb)
-                        if content and not content.startswith('www.') and '›' not in content:
-                            break
-                        else:
-                            content = ''
-                
-                # If no specific content found, use text minus title as fallback
-                if not content and title:
-                    # Try to extract content by removing title from full text
-                    if text.startswith(title):
-                        content = text[len(title):].strip()
-                    else:
-                        content = text
-                elif not content:
-                    content = text
-                    
-                seen.add(href)
-                results.append({
-                    'href': href,
-                    'text': text,
-                    'title': title,
-                    'content': content
-                })
-        else:
-            # Fallback: extract links directly if no result containers found
-            for a in json_soup.find_all('a', href=True):
-                href = a['href']
-                if not href.startswith('http'):
-                    continue
-                if href in seen:
-                    continue
-                text = clean_text_spacing(a.get_text(separator=' ', strip=True))
-                if not text:
-                    continue
-                seen.add(href)
-                # In fallback mode, the link text serves as both title and text
-                results.append({
-                    'href': href,
-                    'text': text,
-                    'title': text,
-                    'content': ''
-                })
+        # The agent-facing JSON contract (see docs/JSON-API.md). Results are
+        # extracted from the *same* filtered soup the HTML view renders, so the
+        # JSON and HTML views can never disagree about which results exist.
+        limit, limit_error = json_parse_limit(request.args.get('limit'))
+        if limit_error:
+            return jsonify(json_error_payload(
+                urlparse.unquote(query), json_api.ERROR_INVALID,
+                limit_error)), 400
 
-        return jsonify({
-            'query': urlparse.unquote(query),
-            'search_type': search_util.search_type,
-            'results': results
-        })
+        payload = json_success_payload(
+            urlparse.unquote(query),
+            search_util.search_type,
+            str(response),
+            limit=limit)
+
+        if payload['count'] == 0:
+            # Distinguish a genuine empty result set from an upstream block or
+            # outage. A block must never look like "no results".
+            signal = json_classify_empty(
+                getattr(search_util, 'upstream_status', 200), str(response))
+            if signal == json_api.ERROR_BLOCKED:
+                app.logger.error('503 (JSON blocked)')
+                return jsonify(json_error_payload(
+                    urlparse.unquote(query), json_api.ERROR_BLOCKED,
+                    translation['ratelimit'], blocked=True)), 503
+            if signal == json_api.ERROR_UPSTREAM:
+                app.logger.error('502 (JSON upstream unavailable)')
+                return jsonify(json_error_payload(
+                    urlparse.unquote(query), json_api.ERROR_UPSTREAM,
+                    'Upstream search engine returned no usable response.'
+                )), 502
+
+        return jsonify(payload)
 
     # Get the user agent that was used for the search
     used_user_agent = ''
@@ -846,6 +750,13 @@ def internal_error(e):
         pass
 
     print(traceback.format_exc(), file=sys.stderr)
+
+    if request_wants_json(request):
+        # Unexpected server error: return the documented JSON error shape so a
+        # caller never receives an HTML page it cannot parse.
+        return jsonify(json_error_payload(
+            urlparse.unquote(query or ''), json_api.ERROR_INTERNAL,
+            'Internal server error')), 500
 
     fallback_engine = os.environ.get('WHOOGLE_FALLBACK_ENGINE_URL', '')
     if (fallback_engine):
