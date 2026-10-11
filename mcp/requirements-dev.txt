@@ -1,0 +1,6 @@
+# Development / test dependencies for the Whoogle Search MCP server.
+#
+# The server itself has no runtime dependencies. The official MCP Python SDK
+# is used only by test/conformance_client.py, as a *client*, to prove the
+# hand-rolled stdio server is protocol-compliant.
+mcp>=1.0.0
