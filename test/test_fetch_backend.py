@@ -6,6 +6,7 @@ from app.services.fetch_backend import (
     DDG_HTML_URL,
     DEFAULT_FETCH_BACKEND,
     DdgHtmlBackend,
+    GoogleHeadlessBackend,
     GoogleHtmlBackend,
     _resolve_target,
     get_backend,
@@ -55,8 +56,11 @@ def test_get_backend_default_and_selection(monkeypatch):
     monkeypatch.setenv("WHOOGLE_FETCH_BACKEND", "ddg-html")
     assert isinstance(get_backend(), DdgHtmlBackend)
 
-    # Unknown / not-yet-implemented backends fall back safely.
-    assert isinstance(get_backend("google-headless"), GoogleHtmlBackend)
+    monkeypatch.setenv("WHOOGLE_FETCH_BACKEND", "google-headless")
+    assert isinstance(get_backend(), GoogleHeadlessBackend)
+    assert get_backend().name == "google-headless"
+
+    # Unknown backends still fall back safely.
     assert isinstance(get_backend("nonsense"), GoogleHtmlBackend)
     # Case/whitespace tolerant.
     assert isinstance(get_backend(" DDG-HTML "), DdgHtmlBackend)

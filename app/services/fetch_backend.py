@@ -27,9 +27,11 @@ Backends:
     blocks are then rewritten into the Google-shaped DOM described above.
 
 ``google-headless``
-    Reserved for a browser-rendered Google backend (a later step); not
-    implemented here. Requesting it falls back to ``google-html`` with a
-    warning rather than failing.
+    A browser-rendered Google backend. Google's wall is passed by actually
+    executing the search page in headless Chromium with a genuine desktop
+    Chrome user agent (a default headless UA is served ``/sorry/``). The
+    rendered SERP DOM is normalised into the same Google-shaped DOM as the
+    other backends. See :mod:`app.services.headless_browser`.
 """
 
 import html
@@ -44,6 +46,8 @@ DEFAULT_FETCH_BACKEND = "google-html"
 GOOGLE_HTML_URL = "https://www.google.com/search?gbv=1&q="
 GOOGLE_IMAGE_URL = "https://www.google.com/search?udm=2&q="
 DDG_HTML_URL = "https://html.duckduckgo.com/html/"
+GOOGLE_HEADLESS_URL = "https://www.google.com/search?q="
+GOOGLE_HEADLESS_IMAGE_URL = "https://www.google.com/search?udm=2&q="
 
 # DuckDuckGo's endpoint challenges non-browser clients. A modern desktop Chrome
 # UA with minimal headers is served results reliably (verified from this host);
@@ -229,18 +233,115 @@ class DdgHtmlBackend(FetchBackend):
         return "".join(parts)
 
 
+def _extract_serp_items(raw_html):
+    """Pull {title, href, snippet} tuples out of a rendered Google SERP.
+
+    Uses Google's current structural cues (verified from this host): the title
+    is the ``a`` tag wrapping an ``h3``; the container is a
+    ``div[data-hveid]``; the snippet lives in a ``.VwiC3b`` element. The old
+    ``div.g`` container no longer exists.
+    """
+    if not raw_html:
+        return []
+    soup = BeautifulSoup(raw_html, "html.parser")
+    items = []
+    for a in soup.find_all("a", href=True):
+        h3 = a.find("h3")
+        if h3 is None:
+            continue
+        title = h3.get_text(" ", strip=True)
+        if not title:
+            continue
+        block = a.find_parent("div", attrs={"data-hveid": True}) or a.parent
+        snippet = ""
+        if block is not None:
+            snippet_el = block.find(class_=SNIPPET_CLASS)
+            if snippet_el is not None:
+                snippet = snippet_el.get_text(" ", strip=True)
+        items.append({
+            "href": a.get("href", ""),
+            "title": title,
+            "snippet": snippet,
+        })
+    return items
+
+
+class GoogleHeadlessBackend(FetchBackend):
+    """Google results via a real (headless) browser render.
+
+    The heavy lifting - launching one headless Chromium, rendering the page
+    and resolving ``/goto`` tokens - live in
+    :mod:`app.services.headless_browser` and is imported lazily so that merely
+    importing this module (and running the app with the default backend) never
+    pulls in the browser dependency.
+    """
+
+    name = "google-headless"
+    search_url = GOOGLE_HEADLESS_URL
+    image_search_url = GOOGLE_HEADLESS_IMAGE_URL
+
+    def fetch(self, http_client, url, headers=None, cookies=None):
+        from app.services import headless_browser as hb
+
+        try:
+            raw_html = hb.get_browser().render(url)
+        except hb.HeadlessChallenge as exc:
+            # Honest negative: Google served its anti-bot page. Return an empty
+            # (but valid) result set rather than pretending we have results.
+            print("Warning: google-headless blocked: %s" % exc)
+            return FetchPage('<div id="main"></div>', status_code=429, url=url)
+        except hb.HeadlessUnavailable as exc:
+            print("Warning: google-headless unavailable: %s" % exc)
+            return FetchPage('<div id="main"></div>', status_code=503, url=url)
+
+        return FetchPage(
+            text=self.parse(raw_html),
+            status_code=200,
+            url=url,
+        )
+
+    def parse(self, raw_html, resolve=None):
+        """Rewrite a rendered Google SERP into Whoogle's Google-shaped DOM.
+
+        ``resolve`` is the URL resolver (defaults to
+        :func:`app.services.headless_browser.resolve_result_url`); tests inject
+        a fake to avoid network access.
+        """
+        if resolve is None:
+            from app.services.headless_browser import resolve_result_url
+            resolve = resolve_result_url
+
+        parts = ['<div id="main">']
+        seen = set()
+        for item in _extract_serp_items(raw_html):
+            href = resolve(item["href"])
+            if not href or not href.startswith("http") or href in seen:
+                continue
+            seen.add(href)
+            parts.append(
+                f'<div class="{RESULT_DIV_CLASS}">'
+                f'<h3><a href="{html.escape(href, quote=True)}">'
+                f'{html.escape(item["title"])}</a></h3>'
+                f'<span class="{SNIPPET_CLASS}">{html.escape(item["snippet"])}'
+                f'</span></div>'
+            )
+        parts.append("</div>")
+        return "".join(parts)
+
+
 _BACKENDS = {
     GoogleHtmlBackend.name: GoogleHtmlBackend,
     DdgHtmlBackend.name: DdgHtmlBackend,
+    GoogleHeadlessBackend.name: GoogleHeadlessBackend,
 }
 
 
 def get_backend(name=None):
     """Return a fetch backend instance for ``name``.
 
-    Reads ``WHOOGLE_FETCH_BACKEND`` when ``name`` is not given. Unknown or
-    not-yet-implemented values (e.g. ``google-headless``) fall back to
-    ``google-html`` with a warning, so a stale config can never break startup.
+    Reads ``WHOOGLE_FETCH_BACKEND`` when ``name`` is not given. Unknown values
+    fall back to ``google-html`` with a warning, so a stale config can never
+    break startup.
     """
     if name is None:
         name = os.getenv("WHOOGLE_FETCH_BACKEND", DEFAULT_FETCH_BACKEND)
