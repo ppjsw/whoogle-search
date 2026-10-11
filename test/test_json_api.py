@@ -194,6 +194,33 @@ def test_classify_empty_uses_raw_wall_marker():
     assert json_api.classify_empty(200, filtered) is None
 
 
+def test_classify_empty_wall_variants():
+    # Marker matching must be case- and quote-insensitive and must include
+    # Google's classic 'unusual traffic' / /sorry/ interstitial wording.
+    filtered = '<div id="main"></div>'
+    blocked_raws = [
+        "<form id='captcha-form'></form>",     # single-quoted attribute
+        "<div class='g-recaptcha'></div>",     # single-quoted attribute
+        "<html>g-recaptcha</html>",            # bare token
+        "<html>Our systems have detected unusual traffic from your "
+        "computer network.</html>",
+        "<html><a href='/sorry/index'>x</a></html>",
+        "<title>Sorry...</title>",
+        "<TITLE>Sorry</TITLE>",                # case-insensitive
+    ]
+    for raw in blocked_raws:
+        assert json_api.classify_empty(200, filtered, raw) == \
+            json_api.ERROR_BLOCKED, raw
+
+
+def test_classify_empty_genuine_no_results_has_no_marker():
+    # A plain empty page (no wall wording) stays a success, not a block.
+    filtered = '<div id="main"></div>'
+    for raw in ("", "<html><body>No results found.</body></html>",
+                "<div id='main'></div>"):
+        assert json_api.classify_empty(200, filtered, raw) is None, raw
+
+
 def test_parse_limit_rejects_lenient_forms():
     for raw in ("1_000", "+2", "1.0", "1e3", "\u06f1\u06f2", "0", "-3"):
         limit, err = json_api.parse_limit(raw)

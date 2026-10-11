@@ -60,21 +60,36 @@ ERROR_CSE_QUOTA = "cse_quota"
 BLOCKED_UPSTREAM_STATUSES = (202, 429)
 UNAVAILABLE_UPSTREAM_STATUSES = (0, 503)
 
-# Markers that identify a wall page when the response carries no result blocks.
-# 'retry/enablejs' is Google's gbv=1 "enable JavaScript" interstitial; the
-# others are the classic challenge forms. These are matched against the RAW
-# upstream body (the Filter strips them from the rendered output). They are
-# deliberately structural (a tag attribute) to avoid matching the phrase in
-# ordinary page text. A *normal* SERP's own bootstrap JS also contains the
-# string '/sorry/', so detection must always be gated on the page yielding zero
-# result blocks (see :func:`classify_empty`). This list is a best-effort net,
-# not a guarantee: an engine can serve an unrecognised intermediate page (e.g.
-# Google's WAP/unsupported-browser page to a legacy UA) that carries no marker.
-WALL_MARKERS = (
-    "retry/enablejs",
-    'id="captcha-form"',
-    'class="g-recaptcha"',
+# Signatures that identify a wall page when the response carries no result
+# blocks. Matched (case-insensitively, quote-agnostically) against the RAW
+# upstream body, because the Filter strips such markup from the rendered
+# output. They mirror the wording that
+# :func:`app.services.headless_browser.looks_like_challenge` uses for the
+# browser lane, so the route-level net agrees with the lane's own detection.
+# Detection is always gated on the page yielding zero result blocks, because a
+# *normal* SERP's own bootstrap JS also contains the string '/sorry/'.
+#
+# Recall is favoured over precision on purpose: the contract (issue #9) is that
+# a block must never be mistaken for "no results". Reporting `blocked` for a
+# page that merely mentions one of these phrases is the safe direction - a
+# caller can retry - whereas silently returning an empty result set misleads.
+_WALL_PATTERNS = (
+    re.compile(r"retry/enablejs", re.IGNORECASE),
+    re.compile(r"captcha-form", re.IGNORECASE),
+    re.compile(r"g-recaptcha", re.IGNORECASE),
+    re.compile(r"unusual traffic", re.IGNORECASE),
+    re.compile(r"/sorry/index", re.IGNORECASE),
+    re.compile(r"support\.google\.com/sorry", re.IGNORECASE),
+    re.compile(r"<title>\s*sorry\b", re.IGNORECASE),
 )
+
+
+def _looks_like_wall(text):
+    """True when ``text`` carries any known anti-bot/challenge signature."""
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in _WALL_PATTERNS)
+
 
 # -- link resolution / anti-token invariant ---------------------------------
 
@@ -370,7 +385,7 @@ def classify_empty(upstream_status, filtered_html, raw_html=None):
     if upstream_status in UNAVAILABLE_UPSTREAM_STATUSES:
         return ERROR_UPSTREAM
     text = str(raw_html if raw_html is not None else filtered_html)
-    if any(marker in text for marker in WALL_MARKERS):
+    if _looks_like_wall(text):
         return ERROR_BLOCKED
     return None
 
