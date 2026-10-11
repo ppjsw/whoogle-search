@@ -473,7 +473,9 @@ def search():
             # Distinguish a genuine empty result set from an upstream block or
             # outage. A block must never look like "no results".
             signal = json_classify_empty(
-                getattr(search_util, 'upstream_status', 200), str(response))
+                getattr(search_util, 'upstream_status', 200),
+                str(response),
+                getattr(search_util, 'upstream_raw', None))
             if signal == json_api.ERROR_BLOCKED:
                 app.logger.error('503 (JSON blocked)')
                 return jsonify(json_error_payload(

@@ -15,7 +15,7 @@ RESULT_DIV = (
 )
 
 
-def _stub_search(monkeypatch, html, upstream_status=200):
+def _stub_search(monkeypatch, html, upstream_status=200, upstream_raw=None):
     """Replace Search's query/response so no network access happens."""
     def fake_new_query(self):
         self.query = 'test'
@@ -23,6 +23,7 @@ def _stub_search(monkeypatch, html, upstream_status=200):
 
     def fake_generate(self):
         self.upstream_status = upstream_status
+        self.upstream_raw = upstream_raw
         return html
 
     monkeypatch.setattr(search_mod.Search, 'new_search_query', fake_new_query)
@@ -114,6 +115,25 @@ def test_json_noresults_is_not_blocked(client, monkeypatch):
 def test_json_blocked_is_distinguishable(client, monkeypatch):
     # Same empty body, but the backend reported a challenge status (429).
     _stub_search(monkeypatch, '<div id="main"></div>', upstream_status=429)
+
+    rv = client.get(f'/{Endpoint.search}?q=test&format=json')
+    assert rv._status_code == 503
+    data = json.loads(rv.data)
+    assert data['blocked'] is True
+    assert data['error_type'] == 'blocked'
+    assert data['results'] == []
+
+
+def test_json_raw_wall_marker_is_blocked(client, monkeypatch):
+    # google-html's JS wall: the filtered soup is empty, but the *raw* upstream
+    # body carries the enablejs marker (the Filter strips it). Must be reported
+    # as blocked, never as a genuine empty result set.
+    _stub_search(
+        monkeypatch,
+        '<div id="main"></div>',
+        upstream_status=200,
+        upstream_raw='<meta content="0;url=/httpservice/retry/enablejs" '
+                     'http-equiv="refresh">')
 
     rv = client.get(f'/{Endpoint.search}?q=test&format=json')
     assert rv._status_code == 503

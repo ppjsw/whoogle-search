@@ -74,6 +74,10 @@ class Search:
         # unavailable). The JSON contract uses this to distinguish a block from
         # a genuine empty result set.
         self.upstream_status = 200
+        # The un-filtered upstream body. The Filter strips wall markup (e.g.
+        # Google's gbv=1 'retry/enablejs' interstitial) from the rendered
+        # output, so block detection must look at the raw body as well.
+        self.upstream_raw = None
         self.search_type = self.request_params.get(
             'tbm') if 'tbm' in self.request_params else ''
 
@@ -252,6 +256,9 @@ class Search:
         # honest empty result set (backends expose .status_code on their
         # response wrapper).
         self.upstream_status = getattr(get_body, 'status_code', 200)
+        # Keep the raw (un-filtered) body too: the Filter removes the wall
+        # markup that block detection needs to see.
+        self.upstream_raw = get_body.text
 
         # Produce cleanable html soup from response
         get_body_safed = get_body.text.replace("&lt;","andlt;").replace("&gt;","andgt;")

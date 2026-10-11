@@ -62,21 +62,40 @@ UNAVAILABLE_UPSTREAM_STATUSES = (0, 503)
 
 # Markers that identify a wall page when the response carries no result blocks.
 # 'retry/enablejs' is Google's gbv=1 "enable JavaScript" interstitial; the
-# others are the classic challenge forms. A *normal* SERP's own bootstrap JS
-# also contains the string '/sorry/', so detection must always be gated on the
-# page yielding zero result blocks (see :func:`classify_empty`).
+# others are the classic challenge forms. These are matched against the RAW
+# upstream body (the Filter strips them from the rendered output). They are
+# deliberately structural (a tag attribute) to avoid matching the phrase in
+# ordinary page text. A *normal* SERP's own bootstrap JS also contains the
+# string '/sorry/', so detection must always be gated on the page yielding zero
+# result blocks (see :func:`classify_empty`). This list is a best-effort net,
+# not a guarantee: an engine can serve an unrecognised intermediate page (e.g.
+# Google's WAP/unsupported-browser page to a legacy UA) that carries no marker.
 WALL_MARKERS = (
     "retry/enablejs",
     'id="captcha-form"',
-    "g-recaptcha",
+    'class="g-recaptcha"',
 )
 
 # -- link resolution / anti-token invariant ---------------------------------
 
 _GOOGLE_REDIRECT_RE = re.compile(
-    r"^https?://(www\.)?google\.[^/]+/(url|goto)\b", re.IGNORECASE)
+    r"^https?://(www\.)?google\.[^/]+/(url|goto)(\?|$)", re.IGNORECASE)
+_GOOGLE_GOTO_RE = re.compile(
+    r"^https?://(www\.)?google\.[^/]+/goto(\?|$)", re.IGNORECASE)
 _DDG_REDIRECT_RE = re.compile(
-    r"^https?://(www\.)?duckduckgo\.com/l/?\?", re.IGNORECASE)
+    r"^https?://(www\.)?duckduckgo\.com/l/?(\?|$)", re.IGNORECASE)
+
+
+def _is_usable_url(href):
+    """True only for an absolute http(s) URL that actually has a host.
+
+    Guards against a redirect "resolution" that yields junk beginning with
+    ``http`` (e.g. ``http://`` or ``httpevil``) or a double-encoded target.
+    """
+    if not href:
+        return False
+    parsed = urlparse.urlparse(href)
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
 def _absolutize(href):
@@ -111,6 +130,11 @@ def resolve_redirect_token(href):
     href = _absolutize(href)
     if not href:
         return ""
+    # An opaque /goto?url=<token> must be checked BEFORE the /url?q= branch:
+    # the token value can itself contain a '/url?q=' substring, which must not
+    # be mistaken for a resolvable target.
+    if _GOOGLE_GOTO_RE.match(href):
+        return ""
     if "/url?q=" in href:
         target = href.split("/url?q=", 1)[1].split("&", 1)[0]
         return urlparse.unquote(target)
@@ -128,11 +152,11 @@ def _safe_href(href):
     redirect token that cannot be resolved to a real URL.
     """
     href = _absolutize(href)
-    if not href.startswith("http://") and not href.startswith("https://"):
+    if not _is_usable_url(href):
         return ""
     if is_redirect_token(href):
         resolved = _absolutize(resolve_redirect_token(href))
-        if (not resolved.startswith("http")
+        if (not _is_usable_url(resolved)
                 or is_redirect_token(resolved)):
             print("Warning: dropping result with unresolvable redirect "
                   "token: %s" % href[:120])
@@ -220,15 +244,16 @@ def extract_results(soup, limit=None):
     if result_divs:
         for div in result_divs:
             link = None
+            href = ""
+            # Try each link in turn until one resolves to a usable, non-token
+            # URL, so an unresolvable token link cannot hide a real link that
+            # follows it in the same container.
             for a in div.find_all("a", href=True):
-                if (a["href"].startswith("http")
-                        or a["href"].startswith("//")):
+                candidate = _safe_href(a["href"])
+                if candidate:
                     link = a
+                    href = candidate
                     break
-            if not link:
-                continue
-
-            href = _safe_href(link["href"])
             if not href or href in seen:
                 continue
 
@@ -305,21 +330,47 @@ def error_payload(query, error_type, message, blocked=False):
     return payload
 
 
-def classify_empty(upstream_status, html):
-    """Classify a zero-result response: ``blocked``, ``upstream`` or ``None``.
+def _has_result_blocks(html):
+    """True when the (filtered) result soup actually contains result blocks.
+
+    Parsed properly rather than substring-matched, so a multi-class attribute
+    such as ``class="foo ZINbbc"`` is still recognised.
+    """
+    from bs4 import BeautifulSoup
+    try:
+        soup = BeautifulSoup(str(html), "html.parser")
+    except Exception:
+        return False
+    return bool(soup.find("div", class_="ZINbbc")
+                or soup.find("div", class_="ezO2md"))
+
+
+def classify_empty(upstream_status, filtered_html, raw_html=None):
+    """Classify a zero-result response: blocked / upstream_error / None.
 
     ``None`` means a genuine, empty result set (HTTP 200, no error key). This
     is the crux of the contract: a challenge page must never look like
-    "no results". Detection requires zero result blocks, because a normal
-    SERP's own JavaScript also references the challenge wording.
+    "no results".
+
+    ``filtered_html`` is the post-:class:`~app.filter.Filter` soup, used only
+    to confirm there really are no result blocks -- a normal SERP's own
+    JavaScript also references the challenge wording, so detection is gated on
+    the page yielding nothing.
+
+    ``raw_html`` is the *un-filtered* upstream body. The Filter strips the wall
+    markup from the rendered output (e.g. Google's gbv=1 ``retry/enablejs``
+    interstitial is removed with the other ``<noscript>``/``<meta>`` content),
+    so wall markers must be looked for in the raw body; falls back to
+    ``filtered_html`` when ``raw_html`` is ``None``.
     """
-    if "class=\"ZINbbc\"" in str(html):
+    if _has_result_blocks(filtered_html):
         return None
     if upstream_status in BLOCKED_UPSTREAM_STATUSES:
         return ERROR_BLOCKED
     if upstream_status in UNAVAILABLE_UPSTREAM_STATUSES:
         return ERROR_UPSTREAM
-    if any(marker in str(html) for marker in WALL_MARKERS):
+    text = str(raw_html if raw_html is not None else filtered_html)
+    if any(marker in text for marker in WALL_MARKERS):
         return ERROR_BLOCKED
     return None
 
@@ -328,14 +379,18 @@ def parse_limit(raw):
     """Validate a ``limit`` request value.
 
     Returns ``(limit, None)`` on success, or ``(None, message)`` on failure.
-    An absent/empty value yields ``(None, None)`` (no cap).
+    An absent/empty value yields ``(None, None)`` (no cap). Only ASCII digits
+    are accepted, so lenient ``int()`` forms (``'1_000'``, ``'+2'``,
+    non-ASCII digits) are rejected rather than silently interpreted.
     """
-    if raw is None or str(raw).strip() == "":
+    if raw is None:
         return None, None
-    try:
-        value = int(str(raw).strip())
-    except (TypeError, ValueError):
+    value_str = str(raw).strip()
+    if not value_str:
+        return None, None
+    if not re.fullmatch(r"[0-9]+", value_str):
         return None, "'limit' must be a positive integer"
+    value = int(value_str)
     if value <= 0:
         return None, "'limit' must be a positive integer"
     return value, None

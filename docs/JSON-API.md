@@ -172,13 +172,19 @@ guarantee is about redirect *tokens*, not tracking parameters.
   the observed queries, not a fixed number.
 - **Block detection signal.** For `google-headless` the block is reported by the
   backend as an upstream HTTP 429 (the browser sees a `/sorry/` anti-bot page);
-  for `ddg-html` as an upstream HTTP 202 with no result blocks. An empty page
-  that also contains a known wall marker (Google's `retry/enablejs`
-  interstitial, `id="captcha-form"`, `g-recaptcha`) is classified `blocked`
-  even at HTTP 200, so the (dead) default `google-html` backend's JavaScript
-  wall is also reported as blocked rather than as "no results". See the PR's
-  RISK section: the `google-headless` lane's own detection is User-Agent based
-  and may tighten.
+  for `ddg-html` as an upstream HTTP 202 with no result blocks. In addition an
+  empty page is classified `blocked` when a known wall marker appears in the
+  **raw, un-filtered upstream body** — Google's `retry/enablejs` interstitial,
+  `id="captcha-form"`, `class="g-recaptcha"`. The raw body is used because the
+  `Filter` strips that markup from the rendered output. This net is
+  **best-effort, not a guarantee**: the (dead) default `google-html` backend,
+  queried live with this instance's User-Agent pool, returned a Google
+  WAP/unsupported-browser page (no results, no recognised marker), which is
+  therefore reported as an empty result set. The reliable signal is the upstream
+  status from the `google-headless` / `ddg-html` backends. The result-block
+  precondition is parsed, not substring-matched, so a multi-class container
+  still counts as results. See the PR's RISK section: the `google-headless`
+  lane's own detection is User-Agent based and may tighten.
 - **The HTML view is unchanged** by this contract. A challenge still renders an
   (empty) HTML results page there; only the JSON path surfaces the structured
   error. This is deliberate — the requirement in issue #9 is about the

@@ -129,6 +129,9 @@ def test_is_redirect_token():
     assert json_api.is_redirect_token("//duckduckgo.com/l/?uddg=https%3A%2F%2Fx")
     assert not json_api.is_redirect_token("https://example.com/page?q=1")
     assert not json_api.is_redirect_token("")
+    # A real page whose path merely starts with 'url' is NOT a token.
+    assert not json_api.is_redirect_token(
+        "https://google.com/url-shortener-tool")
 
 
 def test_resolve_redirect_token():
@@ -138,9 +141,65 @@ def test_resolve_redirect_token():
     assert json_api.resolve_redirect_token(
         "//duckduckgo.com/l/?uddg=https%3A%2F%2Fy.example"
     ) == "https://y.example"
-    # Opaque token: not resolvable offline.
+    # Opaque token: not resolvable offline. The inner '/url?q=' substring in
+    # the token value must NOT be mistaken for a resolvable target.
     assert json_api.resolve_redirect_token(
         "https://www.google.com/goto?url=tok") == ""
+    assert json_api.resolve_redirect_token(
+        "https://www.google.com/goto?url=http://x.com/url?q=http://evil.com"
+    ) == ""
+
+
+# -- adversarial guards (from the subagent audit) ----------------------------
+
+def test_safe_href_rejects_junk_resolution():
+    # '/url?q=httpevil' resolves to a non-URL; it must be dropped, not emitted.
+    assert json_api._safe_href("https://www.google.com/url?q=httpevil") == ""
+    # Scheme-only strings are not usable URLs.
+    assert json_api._safe_href("http://") == ""
+    assert json_api._safe_href("https://") == ""
+
+
+def test_safe_href_rejects_double_encoded_target():
+    href = ("https://www.google.com/url?q="
+            "https%253A%252F%252Fevil.com")
+    assert json_api._safe_href(href) == ""
+
+
+def test_extract_results_token_does_not_hide_real_link():
+    html = ('<div id="main"><div class="ZINbbc">'
+            '<a href="https://www.google.com/goto?url=OPAQUE">A</a>'
+            '<a href="https://real.example.com/page">B real</a>'
+            '</div></div>')
+    payload = json_api.success_payload("q", "", html)
+    assert [r["href"] for r in payload["results"]] == \
+        ["https://real.example.com/page"]
+
+
+def test_classify_empty_multi_class_result_block():
+    # 'foo ZINbbc' (multi-class) is a real result block -> not a block page.
+    html = '<div class="foo ZINbbc"><a href="http://x">r</a></div>g-recaptcha'
+    assert json_api.classify_empty(200, html) is None
+
+
+def test_classify_empty_uses_raw_wall_marker():
+    # The wall marker is stripped from the filtered soup, so it must be read
+    # from the raw upstream body.
+    filtered = '<div id="main"></div>'
+    raw = ('<meta content="0;url=/httpservice/retry/enablejs" '
+           'http-equiv="refresh">')
+    assert json_api.classify_empty(200, filtered, raw) == \
+        json_api.ERROR_BLOCKED
+    # Without the raw body, the same filtered soup is a genuine empty result.
+    assert json_api.classify_empty(200, filtered) is None
+
+
+def test_parse_limit_rejects_lenient_forms():
+    for raw in ("1_000", "+2", "1.0", "1e3", "\u06f1\u06f2", "0", "-3"):
+        limit, err = json_api.parse_limit(raw)
+        assert limit is None and err, raw
+    assert json_api.parse_limit("12") == (12, None)
+    assert json_api.parse_limit(" 4 ") == (4, None)
 
 
 # -- fallback path -----------------------------------------------------------
