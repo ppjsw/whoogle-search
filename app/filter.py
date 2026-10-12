@@ -49,7 +49,13 @@ def extract_q(q_str: str, href: str) -> str:
     Returns:
         str: The 'q' element of the link, or an empty string
     """
-    return parse_qs(q_str, keep_blank_values=True)['q'][0] if ('&q=' in href or '?q=' in href) else ''
+    if '&q=' not in href and '?q=' not in href:
+        return ''
+    # The 'q' element must be read from the query string (q_str). The href may
+    # still contain a nested '?q='/&q=' inside a *different* parameter's value
+    # or a fragment, so indexing 'q' directly can raise KeyError and turn any
+    # such result link into a 500. Fall back to an empty string instead.
+    return parse_qs(q_str, keep_blank_values=True).get('q', [''])[0]
 
 
 def build_map_url(href: str) -> str:
