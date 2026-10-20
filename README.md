@@ -635,22 +635,28 @@ Whoogle can return filtered results as JSON using the same sanitization rules as
 
 - Send `Accept: application/json` or append `format=json` to the search URL.
 - Example: `/search?q=whoogle` with `Accept: application/json`, or `/search?q=whoogle&format=json`.
+- Optional `limit=<n>` caps the number of results (one Google page yields 8-9).
 - Response shape:
 
 ```
 {
   "query": "whoogle",
   "search_type": "",
+  "count": 9,
   "results": [
-    {"href": "https://example.com/page", "text": "Example Page"},
+    {"position": 1, "title": "...", "href": "https://example.com/page", "snippet": "...", "content": "...", "text": "..."},
     ...
   ]
 }
 ```
 
+`href` is always a fully resolved real URL (never a Google `/url?q=` or `/goto` token). A genuine empty result set is HTTP 200 with `count: 0` and no error key; errors (blocked / timeout / upstream) are HTTP 4xx-5xx with a machine-readable `error_type`.
+
 Special cases:
 - Feeling Lucky returns HTTP 303 with body `{ "redirect": "<url>" }`.
-- Temporary blocks (captcha) return HTTP 503 with `{ "blocked": true, "error_message": "...", "query": "..." }`.
+- Temporary blocks (captcha/challenge) return HTTP 503 with `{ "blocked": true, "error_type": "blocked", "error_message": "...", "query": "..." }`.
+
+The full contract — every field, type, error shape and honest limit — is documented in **[docs/JSON-API.md](docs/JSON-API.md)**.
 
 ## Extra Steps
 
