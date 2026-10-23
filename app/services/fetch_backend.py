@@ -345,8 +345,8 @@ class GoogleHeadlessBackend(FetchBackend):
             # Every candidate existed but none could be resolved inside the
             # resolution budget: the SERP is unusable, and reporting "no
             # results" would be a lie.
-            print("Warning: google-headless resolved 0/%d results within the "
-                  "resolution budget" % stats["candidates"])
+            print("Warning: google-headless resolved none of the %d result "
+                  "candidates" % stats["candidates"])
             return FetchPage(self.EMPTY_MAIN, status_code=504, url=url)
 
         if stats["resolved"] and not stats["budget_exhausted"]:
