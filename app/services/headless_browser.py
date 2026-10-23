@@ -225,6 +225,16 @@ class HeadlessBrowser:
             "--disable-sync",
             "--disable-extensions",
             "--mute-audio",
+            # Never talk to the desktop keyring. With a D-Bus session bus
+            # reachable and the login keyring locked (gnome-keyring waiting on
+            # an unlock prompt), Chromium blocks forever during password-store
+            # initialisation: it opens a TCP connection to the target but never
+            # writes the HTTP request, so every render times out. Verified on
+            # this host - the same binary renders a SERP in ~4 s with this
+            # flag (or with DBUS_SESSION_BUS_ADDRESS unset) and hangs
+            # indefinitely without it. A headless renderer has no use for the
+            # keyring anyway.
+            "--password-store=basic",
             "--remote-debugging-address=127.0.0.1",
             f"--remote-debugging-port={self._port}",
             "--remote-allow-origins=*",

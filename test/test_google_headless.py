@@ -190,3 +190,50 @@ def test_shutdown_without_start_is_safe():
     browser = hb.HeadlessBrowser(profile_dir="")
     browser.shutdown()
     browser.shutdown()  # idempotent
+
+
+def test_launch_flags_never_use_the_desktop_keyring(monkeypatch, tmp_path):
+    """The browser must never initialise a password store.
+
+    With a reachable D-Bus session bus and a locked login keyring, Chromium
+    blocks indefinitely in password-store initialisation: it connects to the
+    target host but never writes the HTTP request, so every render times out.
+    ``--password-store=basic`` keeps it away from the keyring. A headless
+    renderer has no use for stored passwords.
+    """
+    captured = {}
+
+    class _FakeProc:
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    def _fake_popen(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return _FakeProc()
+
+    browser = hb.HeadlessBrowser(chromium="/bin/sh", profile_dir=str(tmp_path))
+    monkeypatch.setattr(hb.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(browser, "_wait_for_port", lambda: None)
+    monkeypatch.setattr(browser, "_attach_page", lambda: None)
+
+    browser._start()
+
+    cmd = captured["cmd"]
+    assert "--password-store=basic" in cmd
+    # The flag must be a real argument, not glued onto another one.
+    assert all(a == "--password-store=basic" or not a.startswith("--password-store")
+               for a in cmd)
+    # Guard the other invariants this launch path must keep.
+    assert "--headless=new" in cmd
+    assert any(a.startswith("--user-data-dir=") for a in cmd)
