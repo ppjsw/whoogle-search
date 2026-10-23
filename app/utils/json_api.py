@@ -59,6 +59,11 @@ ERROR_CSE_QUOTA = "cse_quota"
 #   ddg-html challenge -> HTTP 202 with no result blocks
 BLOCKED_UPSTREAM_STATUSES = (202, 429)
 UNAVAILABLE_UPSTREAM_STATUSES = (0, 503)
+# A 504 from a backend means "the engine was reachable but did not answer in
+# time" - for the google-headless lane that is the browser lock or the
+# resolution budget expiring. It maps to the documented `timeout` error
+# (HTTP 504), never to an empty result set.
+TIMEOUT_UPSTREAM_STATUSES = (504,)
 
 # Signatures that identify a wall page when the response carries no result
 # blocks. Matched (case-insensitively, quote-agnostically) against the RAW
@@ -382,6 +387,8 @@ def classify_empty(upstream_status, filtered_html, raw_html=None):
         return None
     if upstream_status in BLOCKED_UPSTREAM_STATUSES:
         return ERROR_BLOCKED
+    if upstream_status in TIMEOUT_UPSTREAM_STATUSES:
+        return ERROR_TIMEOUT
     if upstream_status in UNAVAILABLE_UPSTREAM_STATUSES:
         return ERROR_UPSTREAM
     text = str(raw_html if raw_html is not None else filtered_html)

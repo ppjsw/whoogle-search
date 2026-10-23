@@ -64,6 +64,22 @@ DEFAULT_BROWSER_UA = (
 DEFAULT_RENDER_TIMEOUT = 30.0
 DEFAULT_SETTLE_TIMEOUT = 8.0
 
+# How long a request will wait for the *lock* before giving up. The render
+# timeout bounds one render, but without a bound on lock acquisition a single
+# wedged render would queue every later request behind it for ever. 45 s is
+# roughly one and a half render budgets: long enough that a normal queue of a
+# couple of requests drains, short enough that a caller gets an error instead
+# of hanging.
+DEFAULT_LOCK_TIMEOUT = 45.0
+
+# Overall budget for the ``/goto`` token resolution phase (one network hop per
+# result, run serially), and the cap on any single hop. Keeping the per-hop
+# timeout well under the overall budget means one slow hop cannot consume the
+# whole budget, and the phase as a whole can never outlive
+# ``DEFAULT_RESOLVE_TIMEOUT``.
+DEFAULT_RESOLVE_TIMEOUT = 20.0
+DEFAULT_RESOLVE_HOP_TIMEOUT = 5.0
+
 _CHALLENGE_TITLE_RE = re.compile(r"<title>\s*Sorry\b", re.I)
 _CHALLENGE_TEXT_MARKERS = (
     "unusual traffic",
@@ -95,6 +111,15 @@ class HeadlessUnavailable(RuntimeError):
 
 class HeadlessChallenge(RuntimeError):
     """Raised when Google serves its anti-bot challenge instead of results."""
+
+
+class HeadlessBusy(RuntimeError):
+    """Raised when the browser could not be acquired within the lock budget.
+
+    A wedged render holds the render lock; without a bounded wait every later
+    request would queue behind it for ever. Callers must treat this as an
+    upstream timeout (HTTP 504 in the JSON contract), never as "no results".
+    """
 
 
 def _find_chromium() -> str:
@@ -186,13 +211,15 @@ class HeadlessBrowser:
                  chromium: str = "",
                  profile_dir: str = "",
                  render_timeout: float = DEFAULT_RENDER_TIMEOUT,
-                 settle_timeout: float = DEFAULT_SETTLE_TIMEOUT):
+                 settle_timeout: float = DEFAULT_SETTLE_TIMEOUT,
+                 lock_timeout: float = DEFAULT_LOCK_TIMEOUT):
         self.user_agent = user_agent
         self.chromium = chromium or _find_chromium()
         self._explicit_profile = profile_dir
         self.profile_dir = profile_dir
         self.render_timeout = render_timeout
         self.settle_timeout = settle_timeout
+        self.lock_timeout = lock_timeout
 
         self._proc = None
         self._cdp = None
@@ -306,14 +333,24 @@ class HeadlessBrowser:
     _ANCHOR_JS = "document.querySelectorAll('a h3').length"
     _OUTER_HTML_JS = "document.documentElement.outerHTML"
 
-    def render(self, url: str, timeout: float = None) -> str:
+    def render(self, url: str, timeout: float = None,
+               lock_timeout: float = None) -> str:
         """Load ``url`` headless and return the rendered DOM as HTML.
 
-        Serialised with a lock (concurrency 1). Raises
+        Serialised with a lock (concurrency 1). Waits at most ``lock_timeout``
+        seconds for the browser to become free and raises
+        :class:`HeadlessBusy` if it does not - a wedged render must not be
+        able to queue every later request for ever. Raises
         :class:`HeadlessChallenge` if Google serves its anti-bot page.
         """
         timeout = timeout or self.render_timeout
-        with self._lock:
+        lock_timeout = (self.lock_timeout if lock_timeout is None
+                        else lock_timeout)
+        if not self._lock.acquire(timeout=max(0.0, lock_timeout)):
+            raise HeadlessBusy(
+                "headless browser busy: no render lock within %.1fs" %
+                lock_timeout)
+        try:
             self._ensure_started()
             try:
                 return self._render_locked(url, timeout)
@@ -324,6 +361,8 @@ class HeadlessBrowser:
                 # clean restart is cheaper than trying to reason about it.
                 self._restart()
                 raise
+        finally:
+            self._lock.release()
 
     def _render_locked(self, url: str, timeout: float) -> str:
         deadline = time.time() + timeout
@@ -381,6 +420,7 @@ def get_browser() -> HeadlessBrowser:
                     "WHOOGLE_HEADLESS_PROFILE_DIR", ""),
                 render_timeout=float(os.environ.get(
                     "WHOOGLE_HEADLESS_TIMEOUT", DEFAULT_RENDER_TIMEOUT)),
+                lock_timeout=resolve_lock_timeout(),
             )
         if not _atexit_registered:
             atexit.register(shutdown_browser)
@@ -427,8 +467,48 @@ _GOOGLE_REDIRECT_RE = re.compile(
     r"^https?://(www\.)?google\.[^/]+/(url|goto)\b")
 
 
+def _env_seconds(name, default):
+    """Read a positive number of seconds from ``name`` or fall back."""
+    raw = os.environ.get(name, "")
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        print("Warning: ignoring invalid %s=%r (using %r)"
+              % (name, raw, default))
+        return default
+    if value <= 0:
+        print("Warning: ignoring non-positive %s=%r (using %r)"
+              % (name, raw, default))
+        return default
+    return value
+
+
+def resolve_lock_timeout() -> float:
+    """Lock-acquisition budget (``WHOOGLE_HEADLESS_LOCK_TIMEOUT``)."""
+    return _env_seconds("WHOOGLE_HEADLESS_LOCK_TIMEOUT", DEFAULT_LOCK_TIMEOUT)
+
+
+def resolve_resolve_timeout() -> float:
+    """Overall ``/goto`` resolution budget.
+
+    Read from ``WHOOGLE_HEADLESS_RESOLVE_TIMEOUT``; the per-hop timeout is
+    capped so that it is always smaller than the overall budget.
+    """
+    return _env_seconds(
+        "WHOOGLE_HEADLESS_RESOLVE_TIMEOUT", DEFAULT_RESOLVE_TIMEOUT)
+
+
+def resolve_hop_timeout(budget=None) -> float:
+    """Per-hop timeout: ``DEFAULT_RESOLVE_HOP_TIMEOUT`` capped by the budget."""
+    if budget is None:
+        budget = resolve_resolve_timeout()
+    return min(DEFAULT_RESOLVE_HOP_TIMEOUT, budget)
+
+
 def resolve_result_url(href: str, user_agent: str = DEFAULT_BROWSER_UA,
-                       timeout: float = 15.0):
+                       timeout: float = DEFAULT_RESOLVE_HOP_TIMEOUT):
     """Resolve a Google result href to its real destination URL.
 
     Current Google SERPs carry opaque ``/goto?url=<token>`` links; a GET on
