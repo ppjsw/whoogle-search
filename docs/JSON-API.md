@@ -98,7 +98,7 @@ human-readable `error_message`, and an **empty `results` array with `count: 0`**
 | `error_type` | HTTP | Meaning |
 | --- | --- | --- |
 | `blocked` | 503 | The engine served an anti-bot / CAPTCHA challenge page. |
-| `timeout` | 504 | The upstream engine timed out. |
+| `timeout` | 504 | The upstream engine timed out (including the headless lane's own render-lock / resolution budget — see [HEADLESS-BUDGET.md](HEADLESS-BUDGET.md)). |
 | `upstream_error` | 502 | The engine was unreachable / returned no usable response. |
 | `invalid_request` | 400 | A bad request parameter (e.g. non-integer `limit`). |
 | `cse_error` / `cse_quota` | (CSE code) | Custom Search API error (only when CSE is enabled). |

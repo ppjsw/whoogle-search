@@ -34,12 +34,16 @@ Backends:
     other backends. See :mod:`app.services.headless_browser`.
 """
 
+import functools
 import html
+import inspect
 import os
 import time
 import urllib.parse as urlparse
 
 from bs4 import BeautifulSoup
+
+from app.services.result_cache import get_result_cache
 
 DEFAULT_FETCH_BACKEND = "google-html"
 
@@ -266,6 +270,20 @@ def _extract_serp_items(raw_html):
     return items
 
 
+def _bind_per_hop(resolve, per_hop):
+    """Bind ``per_hop`` as ``resolve``'s timeout, when it accepts one.
+
+    The default resolver (``resolve_result_url``) takes a ``timeout``; an
+    injected resolver - a test fake, or a future alternative - may be a plain
+    one-argument callable, which is then used unchanged.
+    """
+    try:
+        accepts = "timeout" in inspect.signature(resolve).parameters
+    except (TypeError, ValueError):     # builtin / C callables
+        accepts = False
+    return functools.partial(resolve, timeout=per_hop) if accepts else resolve
+
+
 class GoogleHeadlessBackend(FetchBackend):
     """Google results via a real (headless) browser render.
 
@@ -274,50 +292,122 @@ class GoogleHeadlessBackend(FetchBackend):
     :mod:`app.services.headless_browser` and is imported lazily so that merely
     importing this module (and running the app with the default backend) never
     pulls in the browser dependency.
+
+    Three budgets keep this lane usable on a small shared host (see
+    ``docs/HEADLESS-BUDGET.md``):
+
+    * a TTL cache of the *normalised* DOM keyed by request URL, so an
+      identical query skips both the render and the ``/goto`` hops;
+    * a bounded wait for the browser lock, so a wedged render surfaces a
+      ``timeout`` error instead of queueing every later request for ever;
+    * an overall budget for the ``/goto`` resolution phase, after which the
+      unresolved remainder is dropped.
+
+    Only a *complete, successful* render is cached. A challenge page, an
+    unavailable browser, a busy browser and an empty result set are all
+    deliberately left out of the cache: caching a wall page would turn a
+    transient block into a long-lived wrong answer.
     """
 
     name = "google-headless"
     search_url = GOOGLE_HEADLESS_URL
     image_search_url = GOOGLE_HEADLESS_IMAGE_URL
 
+    # An empty-but-valid result document, used for every negative outcome.
+    EMPTY_MAIN = '<div id="main"></div>'
+
     def fetch(self, http_client, url, headers=None, cookies=None):
         from app.services import headless_browser as hb
 
+        cache = get_result_cache()
+        cached = cache.get(url)
+        if cached is not None:
+            return FetchPage(text=cached, status_code=200, url=url)
+
         try:
             raw_html = hb.get_browser().render(url)
+        except hb.HeadlessBusy as exc:
+            # The browser did not become free within the lock budget (another
+            # render is wedged). A timeout, never "no results".
+            print("Warning: google-headless busy: %s" % exc)
+            return FetchPage(self.EMPTY_MAIN, status_code=504, url=url)
         except hb.HeadlessChallenge as exc:
             # Honest negative: Google served its anti-bot page. Return an empty
             # (but valid) result set rather than pretending we have results.
             print("Warning: google-headless blocked: %s" % exc)
-            return FetchPage('<div id="main"></div>', status_code=429, url=url)
+            return FetchPage(self.EMPTY_MAIN, status_code=429, url=url)
         except hb.HeadlessUnavailable as exc:
             print("Warning: google-headless unavailable: %s" % exc)
-            return FetchPage('<div id="main"></div>', status_code=503, url=url)
+            return FetchPage(self.EMPTY_MAIN, status_code=503, url=url)
 
-        return FetchPage(
-            text=self.parse(raw_html),
-            status_code=200,
-            url=url,
-        )
+        html_doc, stats = self._normalize(raw_html)
+        if stats["resolved"] == 0 and stats["candidates"] > 0:
+            # Every candidate existed but none could be resolved inside the
+            # resolution budget: the SERP is unusable, and reporting "no
+            # results" would be a lie.
+            print("Warning: google-headless resolved none of the %d result "
+                  "candidates" % stats["candidates"])
+            return FetchPage(self.EMPTY_MAIN, status_code=504, url=url)
 
-    def parse(self, raw_html, resolve=None):
+        if stats["resolved"] and not stats["budget_exhausted"]:
+            # Cache only a SERP whose resolution phase ran to completion: one
+            # cut short by the budget is left uncached so the next request can
+            # try the remaining hops again. A token that simply cannot be
+            # resolved is a property of the page, so it does not block caching.
+            cache.set(url, html_doc)
+
+        return FetchPage(text=html_doc, status_code=200, url=url)
+
+    def parse(self, raw_html, resolve=None, budget=None):
         """Rewrite a rendered Google SERP into Whoogle's Google-shaped DOM.
 
         ``resolve`` is the URL resolver (defaults to
-        :func:`app.services.headless_browser.resolve_result_url`); tests inject
-        a fake to avoid network access.
+        :func:`app.services.headless_browser.resolve_result_url` with its
+        per-hop timeout); tests inject a fake to avoid network access.
+
+        ``budget`` is the overall budget in seconds for the whole resolution
+        phase (defaults to ``WHOOGLE_HEADLESS_RESOLVE_TIMEOUT``). Results that
+        cannot be resolved within it are dropped rather than stalling the
+        request.
         """
+        return self._normalize(raw_html, resolve=resolve, budget=budget)[0]
+
+    def _normalize(self, raw_html, resolve=None, budget=None):
+        """Return ``(google_shaped_dom, stats)`` for a rendered SERP.
+
+        ``stats`` reports ``candidates`` (result blocks found), ``resolved``
+        (emitted), ``dropped`` (candidates that yielded no usable URL) and
+        whether the resolution budget was exhausted, so :meth:`fetch` can tell
+        a partial SERP from a complete one.
+        """
+        from app.services import headless_browser as hb
+
         if resolve is None:
-            from app.services.headless_browser import resolve_result_url
-            resolve = resolve_result_url
+            per_hop = hb.resolve_hop_timeout(budget)
+            resolve = _bind_per_hop(hb.resolve_result_url, per_hop)
+        if budget is None:
+            budget = hb.resolve_resolve_timeout()
+        deadline = time.monotonic() + budget
+
+        stats = {"candidates": 0, "resolved": 0, "dropped": 0,
+                 "budget_exhausted": False}
 
         parts = ['<div id="main">']
         seen = set()
         for item in _extract_serp_items(raw_html):
+            stats["candidates"] += 1
+            if time.monotonic() >= deadline:
+                # Out of budget: drop this and every remaining result rather
+                # than let the request hang on more network hops.
+                stats["dropped"] += 1
+                stats["budget_exhausted"] = True
+                continue
             href = resolve(item["href"])
             if not href or not href.startswith("http") or href in seen:
+                stats["dropped"] += 1
                 continue
             seen.add(href)
+            stats["resolved"] += 1
             parts.append(
                 f'<div class="{RESULT_DIV_CLASS}">'
                 f'<h3><a href="{html.escape(href, quote=True)}">'
@@ -326,7 +416,7 @@ class GoogleHeadlessBackend(FetchBackend):
                 f'</span></div>'
             )
         parts.append("</div>")
-        return "".join(parts)
+        return "".join(parts), stats
 
 
 _BACKENDS = {

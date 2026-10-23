@@ -487,6 +487,15 @@ def search():
                     urlparse.unquote(query), json_api.ERROR_UPSTREAM,
                     'Upstream search engine returned no usable response.'
                 )), 502
+            if signal == json_api.ERROR_TIMEOUT:
+                # The headless lane's own budget expired (browser lock wait or
+                # the /goto resolution phase). A timeout is not "no results".
+                app.logger.error('504 (JSON upstream timeout)')
+                return jsonify(json_error_payload(
+                    urlparse.unquote(query), json_api.ERROR_TIMEOUT,
+                    'The search engine did not answer within the configured '
+                    'budget.'
+                )), 504
 
         return jsonify(payload)
 
